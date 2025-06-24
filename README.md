@@ -1,4 +1,4 @@
-# CrossRef Publication & Retraction Tracker
+# CrossRef Publication & Retraction Fetcher
 
 A reproducible Python toolkit for meta-research on scholarly publishing trends.  
 Fetches and analyzes year-by-year:
