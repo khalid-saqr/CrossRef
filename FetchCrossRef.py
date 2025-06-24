@@ -1,128 +1,178 @@
-#!/usr/bin/env python3
-import requests
-import time
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.stats import linregress
-
-# --- Configuration ---
-MAILTO = "your_email@domain.com"   # Per CrossRef etiquette
-START_YEAR = 2004
-END_YEAR = 2024
-
-# --- Fetching functions ---
-def fetch_total_publications(start, end, mailto):
-    """Yearly total DOI registrations from CrossRef."""
-    counts = {}
-    for y in range(start, end + 1):
-        params = {
-            'filter': f'from-pub-date:{y}-01-01,until-pub-date:{y}-12-31',
-            'rows': 0,
-            'mailto': mailto
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "authorship_tag": "ABX9TyMa1QQUES+BIWHqMT+uVDCj"
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "import requests\n",
+        "import time\n",
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "from scipy.stats import linregress\n",
+        "from scipy.optimize import curve_fit\n",
+        "from urllib3.util import Retry\n",
+        "from requests.adapters import HTTPAdapter\n",
+        "\n",
+        "# ==== CONFIG ====\n",
+        "MAILTO = \"research@knowdyn.co.uk\"\n",
+        "START_YEAR, END_YEAR = 2004, 2024\n",
+        "years = np.arange(START_YEAR, END_YEAR + 1)\n",
+        "\n",
+        "# ==== SESSION with RETRY ====\n",
+        "session = requests.Session()\n",
+        "retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=[\"GET\"])\n",
+        "session.mount(\"https://\", HTTPAdapter(max_retries=retries))\n",
+        "\n",
+        "def fetch_counts(filter_args, start, end, mailto, query_title=None):\n",
+        "    \"\"\"Generic fetcher for CrossRef counts (with optional title search).\"\"\"\n",
+        "    results = {}\n",
+        "    for year in range(start, end + 1):\n",
+        "        base_filter = f\"from-pub-date:{year}-01-01,until-pub-date:{year}-12-31\"\n",
+        "        full_filter = f\"{base_filter},{filter_args}\" if filter_args else base_filter\n",
+        "        params = {'filter': full_filter, 'rows': 0, 'mailto': mailto}\n",
+        "        if query_title is not None:\n",
+        "            params['query.title'] = query_title\n",
+        "        try:\n",
+        "            resp = session.get('https://api.crossref.org/works', params=params, timeout=30)\n",
+        "            resp.raise_for_status()\n",
+        "            count = resp.json()['message']['total-results']\n",
+        "        except Exception as e:\n",
+        "            print(f\"ERROR fetching {year}: {e}\")\n",
+        "            count = None\n",
+        "        results[year] = count\n",
+        "        time.sleep(0.2)\n",
+        "    return results\n",
+        "\n",
+        "# ==== DATA FETCH ====\n",
+        "pubs = fetch_counts(\"\", START_YEAR, END_YEAR, MAILTO)\n",
+        "rets = fetch_counts(\"\", START_YEAR, END_YEAR, MAILTO,\n",
+        "    query_title='Retraction OR Retracted OR \"Retraction Notice\" OR \"Retraction Note\" OR \"Retracted article\"')\n",
+        "covid = fetch_counts(\"update-type:retraction\", 2019, END_YEAR, MAILTO,\n",
+        "    query_title=\"COVID-19 OR SARS-CoV-2 OR Coronavirus\")\n",
+        "preprints = fetch_counts(\"type:posted-content\", START_YEAR, END_YEAR, MAILTO)\n",
+        "\n",
+        "df = pd.DataFrame({\n",
+        "    'Publications': [pubs.get(y) for y in years],\n",
+        "    'Retractions': [rets.get(y) for y in years],\n",
+        "    'COVID_Retraction': [covid.get(y, 0) for y in years],\n",
+        "    'Preprints': [preprints.get(y) for y in years]\n",
+        "}, index=years)\n",
+        "\n",
+        "# ==== REGRESSION FUNCTIONS ====\n",
+        "def exp_fit(x, a, b):\n",
+        "    return a * np.exp(b * (x - x[0]))\n",
+        "def quad_fit(x, a, b, c):\n",
+        "    return a * (x - x[0])**2 + b * (x - x[0]) + c\n",
+        "def logistic_fit(x, L, k, x0):\n",
+        "    return L / (1 + np.exp(-k*(x - x0)))\n",
+        "\n",
+        "def model_compare(x, y):\n",
+        "    mask = (np.array(y) > 0) & ~np.isnan(y)\n",
+        "    x, y = np.array(x)[mask], np.array(y)[mask]\n",
+        "    # Exponential (log-linear)\n",
+        "    slope, intercept, r2, _, _ = linregress(x, np.log(y))\n",
+        "    y_exp = np.exp(intercept + slope * x)\n",
+        "    exp_r2 = 1 - np.sum((y - y_exp) ** 2) / np.sum((y - y.mean()) ** 2)\n",
+        "    # Quadratic\n",
+        "    qparams = np.polyfit(x-x[0], y, 2)\n",
+        "    y_quad = np.polyval(qparams, x-x[0])\n",
+        "    quad_r2 = 1 - np.sum((y - y_quad) ** 2) / np.sum((y - y.mean()) ** 2)\n",
+        "    # Logistic\n",
+        "    try:\n",
+        "        L0, k0, x0_0 = max(y), 0.2, x[y.argmax()] if len(y) > 1 else x[0]\n",
+        "        lparams, _ = curve_fit(logistic_fit, x, y, p0=[L0, k0, x0_0], maxfev=10000)\n",
+        "        y_logi = logistic_fit(x, *lparams)\n",
+        "        logi_r2 = 1 - np.sum((y - y_logi) ** 2) / np.sum((y - y.mean()) ** 2)\n",
+        "    except Exception:\n",
+        "        y_logi, logi_r2, lparams = y, np.nan, [np.nan]*3\n",
+        "    # Doubling time (exp only)\n",
+        "    dt = np.log(2) / slope if slope > 0 else np.nan\n",
+        "    return {\n",
+        "        'exp': (y_exp, exp_r2, slope, dt),\n",
+        "        'quad': (y_quad, quad_r2, qparams),\n",
+        "        'logi': (y_logi, logi_r2, lparams)\n",
+        "    }\n",
+        "\n",
+        "results = {}\n",
+        "summary = {}\n",
+        "for col in ['Publications', 'Retractions', 'Preprints']:\n",
+        "    res = model_compare(df.index.values, df[col].values)\n",
+        "    results[col] = res\n",
+        "    summary[col] = {\n",
+        "        'exp_r2': res['exp'][1],\n",
+        "        'quad_r2': res['quad'][1],\n",
+        "        'logi_r2': res['logi'][1],\n",
+        "        'exp_doubling': res['exp'][3]\n",
+        "    }\n",
+        "    # add fits to df\n",
+        "    df[f'{col}_ExpFit'] = np.nan\n",
+        "    df[f'{col}_QuadFit'] = np.nan\n",
+        "    df[f'{col}_LogiFit'] = np.nan\n",
+        "    mask = (df[col].values > 0) & ~np.isnan(df[col].values)\n",
+        "    x = df.index.values[mask]\n",
+        "    df.loc[x, f'{col}_ExpFit'] = res['exp'][0]\n",
+        "    df.loc[x, f'{col}_QuadFit'] = res['quad'][0]\n",
+        "    df.loc[x, f'{col}_LogiFit'] = res['logi'][0]\n",
+        "\n",
+        "# ==== PLOTS ====\n",
+        "def plot_compare(col, scale=1, ylabel='', fname='plot.png'):\n",
+        "    x = df.index.values\n",
+        "    plt.figure(figsize=(10, 6))\n",
+        "    plt.scatter(x, df[col]/scale, c='k', label='Data')\n",
+        "    plt.plot(x, df[f'{col}_ExpFit']/scale, 'r-', label=f'Exp fit ($R^2$={summary[col][\"exp_r2\"]:.3f})')\n",
+        "    plt.plot(x, df[f'{col}_QuadFit']/scale, 'g--', label=f'Quad fit ($R^2$={summary[col][\"quad_r2\"]:.3f})')\n",
+        "    plt.plot(x, df[f'{col}_LogiFit']/scale, 'b:', label=f'Logistic fit ($R^2$={summary[col][\"logi_r2\"]:.3f})')\n",
+        "    plt.title(f'{col} Trend and Fits')\n",
+        "    plt.xlabel('Year')\n",
+        "    plt.ylabel(ylabel)\n",
+        "    plt.grid(True, linestyle=':')\n",
+        "    plt.legend()\n",
+        "    plt.tight_layout()\n",
+        "    plt.savefig(fname, dpi=150)\n",
+        "    plt.close()\n",
+        "\n",
+        "plot_compare('Publications', scale=1e6, ylabel='Publications (Millions)', fname='publications_compare.png')\n",
+        "plot_compare('Retractions', scale=1e3, ylabel='Retractions (Thousands)', fname='retractions_compare.png')\n",
+        "plot_compare('Preprints', scale=1e3, ylabel='Preprints (Thousands)', fname='preprints_compare.png')\n",
+        "\n",
+        "# ==== SAVE ====\n",
+        "df.to_csv('analysis_time_series.csv', float_format='%.4f')\n",
+        "pd.DataFrame(summary).to_csv('regression_summary.csv')\n",
+        "\n",
+        "print(\"Plots and CSVs saved (analysis_time_series.csv, regression_summary.csv, and 3 PNGs).\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "YhKm1UZMf-8M",
+        "outputId": "7ed957a5-3e3f-4186-f27c-2d35d3b8457f"
+      },
+      "execution_count": 1,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Plots and CSVs saved (analysis_time_series.csv, regression_summary.csv, and 3 PNGs).\n"
+          ]
         }
-        resp = requests.get('https://api.crossref.org/works', params=params)
-        resp.raise_for_status()
-        counts[y] = resp.json()['message']['total-results']
-        time.sleep(1)
-    return counts
-
-def fetch_retraction_counts(start, end, mailto):
-    """Yearly CrossRef works whose titles contain retraction keywords."""
-    query = 'Retraction OR Retracted OR "Retraction Notice" OR "Retraction Note" OR "Retracted article"'
-    counts = {}
-    for y in range(start, end + 1):
-        params = {
-            'filter': f'from-pub-date:{y}-01-01,until-pub-date:{y}-12-31',
-            'query.title': query,
-            'rows': 0,
-            'mailto': mailto
-        }
-        resp = requests.get('https://api.crossref.org/works', params=params)
-        resp.raise_for_status()
-        counts[y] = resp.json()['message']['total-results']
-        time.sleep(1)
-    return counts
-
-def fetch_covid_retraction_counts(start, end, mailto):
-    """Yearly CrossRef retraction notices mentioning COVID-19."""
-    covid_terms = "COVID-19 SARS-CoV-2 Coronavirus"
-    counts = {}
-    for y in range(start, end + 1):
-        params = {
-            'filter': f'from-pub-date:{y}-01-01,until-pub-date:{y}-12-31,update-type:retraction',
-            'query.title': covid_terms,
-            'rows': 0,
-            'mailto': mailto
-        }
-        resp = requests.get('https://api.crossref.org/works', params=params)
-        resp.raise_for_status()
-        counts[y] = resp.json()['message']['total-results']
-        time.sleep(1)
-    return counts
-
-# --- Main report assembly ---
-if __name__ == "__main__":
-    # 1. Fetch data
-    print("\nFetching total publication counts...")
-    pubs = fetch_total_publications(START_YEAR, END_YEAR, MAILTO)
-
-    print("\nFetching retraction counts...")
-    retractions = fetch_retraction_counts(START_YEAR, END_YEAR, MAILTO)
-
-    print("\nFetching COVID-19 retraction counts...")
-    covid_retracts = fetch_covid_retraction_counts(2019, END_YEAR, MAILTO)
-
-    # 2. Build DataFrame
-    df = pd.DataFrame({
-        'Year': list(range(START_YEAR, END_YEAR+1)),
-        'Total_Publications': [pubs[y] for y in range(START_YEAR, END_YEAR+1)],
-        'Retractions': [retractions[y] for y in range(START_YEAR, END_YEAR+1)],
-        'COVID_Retractions': [covid_retracts.get(y, 0) for y in range(START_YEAR, END_YEAR+1)]
-    })
-    df.set_index('Year', inplace=True)
-
-    # 3. Print tables
-    pd.set_option('display.max_rows', None)
-    print("\n=== Yearly Totals ===")
-    print(df)
-
-    # 4. Plot 1: Publications with exponential fit & doubling markers
-    years = df.index.values
-    vals = df['Total_Publications'].values
-    slope, intercept, r_val, _, _ = linregress(years, np.log(vals))
-    fit = np.exp(intercept + slope * years)
-
-    # Doubling thresholds
-    base = vals[0]
-    doubles = [2*base, 4*base]
-    dbl_years = [years[np.argmax(vals >= d)] for d in doubles]
-
-    plt.figure(figsize=(10,6))
-    plt.scatter(years, vals/1e6, color='navy', s=50, label='Data')
-    plt.plot(years, fit/1e6, 'r-', label=f'Fit ($R^2$={r_val**2:.3f})')
-    for i, dy in enumerate(dbl_years, start=1):
-        plt.plot(dy, vals[dy-START_YEAR]/1e6, 'k*', markersize=15, label=f'{i*2}× @ {dy}')
-    plt.title('CrossRef Publications (2004–2024)')
-    plt.xlabel('Year')
-    plt.ylabel('Publications (millions)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('publications.png')
-    print("\nSaved plot: publications.png")
-
-    # 5. Plot 2: Retractions vs COVID retractions (log scale)
-    plt.figure(figsize=(10,6))
-    w = 0.4
-    plt.bar(years - w/2, df['Retractions'], width=w, color='skyblue', label='Retractions')
-    plt.bar(years + w/2, df['COVID_Retractions'], width=w, color='salmon', label='COVID-19 Retractions')
-    plt.yscale('log')
-    plt.title('Retractions vs COVID-19 Retractions (2004–2024)')
-    plt.xlabel('Year')
-    plt.ylabel('Count (log scale)')
-    plt.legend()
-    plt.grid(which='both', axis='y', linestyle='--', linewidth=0.5)
-    plt.tight_layout()
-    plt.savefig('retractions.png')
-    print("Saved plot: retractions.png\n")
+      ]
+    }
+  ]
+}
